@@ -852,6 +852,35 @@ get_bundle_path (const char *bundle, char **allocated)
   return *allocated;
 }
 
+#define HOOK_OUTPUT_MAX 128
+
+static int
+read_hook_output (int fd, char *buffer, size_t max_size)
+{
+  ssize_t ret;
+  size_t total = 0;
+
+  if (fd < 0)
+    return 0;
+
+  while (total < max_size)
+    {
+      ret = TEMP_FAILURE_RETRY (read (fd, buffer + total, max_size - total));
+      if (ret < 0)
+        {
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+          return -1;
+        }
+      if (ret == 0)
+        break;
+      total += ret;
+    }
+
+  buffer[total] = ' ';
+  return total;
+}
+
 static int
 do_hooks (runtime_spec_schema_config_schema *def, pid_t pid, const char *id, bool keep_going, const char *bundle,
           const char *cwd, const char *status, const char *name, hook **hooks, size_t hooks_len, int out_fd,
@@ -904,6 +933,12 @@ do_hooks (runtime_spec_schema_config_schema *def, pid_t pid, const char *id, boo
   for (i = 0; i < hooks_len; i++)
     {
       char **env = environ;
+      int capture_out_fd = -1, capture_err_fd = -1;
+      cleanup_close int pipe_out[2] = {-1, -1};
+      cleanup_close int pipe_err[2] = {-1, -1};
+      char out_buf[HOOK_OUTPUT_MAX + 1] = {0};
+      char err_buf[HOOK_OUTPUT_MAX + 1] = {0};
+      int actual_out_fd = out_fd, actual_err_fd = err_fd;
 
       if (hooks[i]->env)
         env = hooks[i]->env;
@@ -915,18 +950,77 @@ do_hooks (runtime_spec_schema_config_schema *def, pid_t pid, const char *id, boo
           error_created = false;
         }
 
+      /* If no annotation is set, capture output for error reporting.  */
+      if (out_fd < 0)
+        {
+          if (pipe2 (pipe_out, O_CLOEXEC) < 0)
+            {
+              libcrun_error (errno, "create stdout pipe");
+              actual_out_fd = -1;
+            }
+          else
+            actual_out_fd = pipe_out[1];
+        }
+
+      if (err_fd < 0)
+        {
+          if (pipe2 (pipe_err, O_CLOEXEC) < 0)
+            {
+              libcrun_error (errno, "create stderr pipe");
+              actual_err_fd = -1;
+            }
+          else
+            actual_err_fd = pipe_err[1];
+        }
+
       ret = run_process_with_stdin_timeout_envp (hooks[i]->path, hooks[i]->args, cwd, hooks[i]->timeout, env,
-                                                 stdin, stdin_len, out_fd, err_fd, can_ignore_chdir_errors, err);
+                                                 stdin, stdin_len, actual_out_fd, actual_err_fd, can_ignore_chdir_errors, err);
       if (UNLIKELY (ret < 0))
         error_created = true;
 
+      /* Close write ends of pipes.  */
+      if (pipe_out[1] >= 0)
+        close_and_reset (&pipe_out[1]);
+      if (pipe_err[1] >= 0)
+        close_and_reset (&pipe_err[1]);
+
+      /* Read captured output if hook failed.  */
+      if (ret != 0 && pipe_out[0] >= 0)
+        read_hook_output (pipe_out[0], out_buf, HOOK_OUTPUT_MAX);
+      if (ret != 0 && pipe_err[0] >= 0)
+        read_hook_output (pipe_err[0], err_buf, HOOK_OUTPUT_MAX);
+
       if (UNLIKELY (ret != 0))
         {
+          char error_msg[512];
+          int msg_len;
+
           if (keep_going)
-            libcrun_warning ("error running %s hook #%zu: `%s` (exit code: %d)", name, i, hooks[i]->path, ret);
+            {
+              if (out_buf[0] || err_buf[0])
+                libcrun_warning ("error running %s hook #%zu: `%s` (exit code: %d), stdout: %s, stderr: %s",
+                                 name, i, hooks[i]->path, ret,
+                                 out_buf[0] ? out_buf : "(none)",
+                                 err_buf[0] ? err_buf : "(none)");
+              else
+                libcrun_warning ("error running %s hook #%zu: `%s` (exit code: %d)", name, i, hooks[i]->path, ret);
+            }
           else
             {
-              libcrun_error (0, "error running %s hook #%zu: `%s` (exit code: %d)", name, i, hooks[i]->path, ret);
+              if (out_buf[0] || err_buf[0])
+                {
+                  msg_len = snprintf (error_msg, sizeof (error_msg),
+                                      "error running %s hook #%zu: `%s` (exit code: %d), stdout: %s, stderr: %s",
+                                      name, i, hooks[i]->path, ret,
+                                      out_buf[0] ? out_buf : "(none)",
+                                      err_buf[0] ? err_buf : "(none)");
+                  if (msg_len >= 0 && msg_len < (int) sizeof (error_msg))
+                    libcrun_error (0, "%s", error_msg);
+                  else
+                    libcrun_error (0, "error running %s hook #%zu: `%s` (exit code: %d)", name, i, hooks[i]->path, ret);
+                }
+              else
+                libcrun_error (0, "error running %s hook #%zu: `%s` (exit code: %d)", name, i, hooks[i]->path, ret);
               break;
             }
         }

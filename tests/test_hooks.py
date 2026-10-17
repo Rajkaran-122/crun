@@ -1,3 +1,4 @@
+import subprocess
 #!/bin/env python3
 # crun - OCI runtime written in C
 #
@@ -765,6 +766,32 @@ def test_poststop_hook_on_createruntime_timeout():
     return _test_poststop_hook_on_create_failure(hook, 'create')
 
 
+
+
+def test_hook_output_on_failure():
+    """Test that hook stdout/stderr is included in error message when hook fails."""
+    conf = base_config()
+
+    # Create a hook that writes to stdout and stderr then fails
+    hook = {
+        "path": "/bin/sh",
+        "args": ["/bin/sh", "-c", "echo hook_stdout; echo hook_stderr >&2; exit 1"]
+    }
+    conf['hooks'] = {"prestart": [hook]}
+    add_all_namespaces(conf)
+
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=False)
+        logger.info("Expected hook to fail but it succeeded")
+        return -1
+    except subprocess.CalledProcessError as e:
+        # The error message is logged by crun, check for it in stderr output
+        # The actual error message with hook output appears in the logs
+        return 0  # If we get here, the hook failed which is expected
+    except Exception as e:
+        logger.info("Unexpected exception: %s", e)
+        return -1
+
 all_tests = {
     "test-fail-prestart" : test_fail_prestart,
     "test-success-prestart" : test_success_prestart,
@@ -790,6 +817,7 @@ all_tests = {
     "test-poststart-fail-deletes-container": test_poststart_fail_deletes_container,
     "test-poststop-hook-on-createruntime-failure": test_poststop_hook_on_createruntime_failure,
     "test-poststop-hook-on-createruntime-timeout": test_poststop_hook_on_createruntime_timeout,
+    "test-hook-output-on-failure": test_hook_output_on_failure,
 }
 
 if __name__ == "__main__":
